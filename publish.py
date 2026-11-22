@@ -1,5 +1,6 @@
-"""PastryPower - publication auto Insta + Facebook depuis Google Drive (tourne sur GitHub Actions)."""
-import csv, io, json, os, sys, time, unicodedata
+"""PastryPower - file d'attente auto : chaque video deposee dans le dossier Drive sort au prochain creneau.
+Titre = nom du fichier. Creneaux reglables dans HEURES (workflow). Tourne sur GitHub Actions."""
+import json, os, sys, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -9,12 +10,8 @@ import requests
 G = "https://graph.facebook.com/v26.0"
 TZ = ZoneInfo("Europe/Paris")
 STATE = "state.json"
-MAX_RETARD = timedelta(hours=12)  # au-delà, on ne publie plus une vidéo ratée
-
-
-def norm(s):
-    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
-    return "".join(c for c in s.lower() if c.isalnum())
+VIDEOS = (".mp4", ".mov", ".m4v")
+FENETRE = timedelta(hours=6)  # un creneau rate de plus de 6 h est saute
 
 
 def api(method, url, **kw):
@@ -49,8 +46,7 @@ def publier_insta(c, chemin, titre):
         time.sleep(10)
     else:
         raise RuntimeError("traitement Insta trop long")
-    return api("POST", f"{G}/{c['ig_id']}/media_publish",
-               data={"creation_id": cont["id"], "access_token": tok})["id"]
+    api("POST", f"{G}/{c['ig_id']}/media_publish", data={"creation_id": cont["id"], "access_token": tok})
 
 
 def publier_fb(c, chemin, titre):
@@ -61,86 +57,57 @@ def publier_fb(c, chemin, titre):
         "upload_phase": "finish", "video_id": start["video_id"],
         "video_state": "PUBLISHED", "description": titre, "access_token": tok,
     })
-    return start["video_id"]
-
-
-def lire_date(d, h):
-    d, h = d.strip(), h.strip().lower().replace("h", ":")
-    if h.endswith(":"):
-        h += "00"
-    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%y %H:%M", "%Y-%m-%d %H:%M"):
-        try:
-            return datetime.strptime(f"{d} {h}", fmt).replace(tzinfo=TZ)
-        except ValueError:
-            pass
-    raise ValueError(f"date/heure illisible : {d} {h}")
 
 
 def main():
-    comptes = {norm(k): v for k, v in json.loads(os.environ["META_COMPTES"]).items()}
+    compte = next(iter(json.loads(os.environ["META_COMPTES"]).values()))
     etat = json.load(open(STATE, encoding="utf-8")) if os.path.exists(STATE) else {}
-    csv_txt = requests.get(os.environ["SHEET_CSV_URL"], timeout=60)
-    csv_txt.encoding = "utf-8"
-    lignes = list(csv.DictReader(io.StringIO(csv_txt.text)))
+    etat.setdefault("publiees", {})
+    etat.setdefault("creneaux", {})
     maintenant = datetime.now(TZ)
 
-    a_faire = []
-    for l in lignes:
-        l = {norm(k): (v or "").strip() for k, v in l.items() if k}
-        if not l.get("fichier"):
-            continue
-        cle = f"{l['fichier']}|{l.get('compte','')}|{l.get('date','')}|{l.get('heure','')}"
-        if etat.get(cle, {}).get("statut") == "publié":
-            continue
-        try:
-            quand = lire_date(l.get("date", ""), l.get("heure", ""))
-        except ValueError as e:
-            etat[cle] = {"statut": f"erreur : {e}"}
-            continue
-        if quand > maintenant:
-            continue
-        if maintenant - quand > MAX_RETARD:
-            etat[cle] = {"statut": "trop tard (plus de 12 h de retard), non publié"}
-            continue
-        a_faire.append((cle, l))
+    # creneau du moment : le plus recent deja passe, dans la fenetre, pas encore utilise
+    creneau = None
+    for jour in (maintenant.date(), maintenant.date() - timedelta(days=1)):
+        for h in sorted(os.environ.get("HEURES", "18:30").split(","), reverse=True):
+            hh, mm = map(int, h.strip().split(":"))
+            t = datetime(jour.year, jour.month, jour.day, hh, mm, tzinfo=TZ)
+            cle = t.strftime("%Y-%m-%d %H:%M")
+            if t <= maintenant < t + FENETRE and cle not in etat["creneaux"]:
+                creneau = cle
+                break
+        if creneau:
+            break
+    if not creneau:
+        print("Pas de créneau à servir maintenant.")
+        return
 
-    erreurs = 0
-    if a_faire:
-        fichiers = {f.path.split("/")[-1]: f.id for f in
-                    gdown.download_folder(os.environ["DRIVE_FOLDER_URL"], skip_download=True, quiet=True)}
-        for cle, l in a_faire:
-            deja = etat.get(cle, {}).get("faits", [])
-            res = {"faits": list(deja)}
-            try:
-                c = comptes.get(norm(l.get("compte", "")))
-                if not c:
-                    raise RuntimeError(f"compte « {l.get('compte')} » inconnu")
-                fid = fichiers.get(l["fichier"])
-                if not fid:
-                    raise RuntimeError("vidéo introuvable dans le dossier Drive")
-                chemin = os.path.join("/tmp", l["fichier"])
-                gdown.download(id=fid, output=chemin, quiet=True)
-                for r in [x.strip().lower() for x in (l.get("reseaux") or "insta,fb").split(",") if x.strip()]:
-                    if r in res["faits"]:
-                        continue
-                    if r == "insta":
-                        publier_insta(c, chemin, l.get("titre", ""))
-                    elif r == "fb":
-                        publier_fb(c, chemin, l.get("titre", ""))
-                    else:
-                        raise RuntimeError(f"réseau inconnu : {r}")
-                    res["faits"].append(r)
-                    print(f"OK {r} : {l['fichier']}")
-                res["statut"] = "publié"
-                res["le"] = maintenant.strftime("%d/%m/%Y %H:%M")
-            except Exception as e:
-                erreurs += 1
-                res["statut"] = f"erreur : {e}"
-                print(f"ERREUR {l['fichier']} : {e}")
-            etat[cle] = res
+    fichiers = gdown.download_folder(os.environ["DRIVE_FOLDER_URL"], skip_download=True, quiet=True) or []
+    file = sorted([f for f in fichiers if f.path.lower().endswith(VIDEOS)
+                   and f.path.split("/")[-1] not in etat["publiees"]], key=lambda f: f.path.lower())
+    if not file:
+        print("File d'attente vide.")
+        return
 
+    v = file[0]
+    nom = v.path.split("/")[-1]
+    titre = os.path.splitext(nom)[0].replace("_", " ").strip()
+    chemin = os.path.join("/tmp", nom)
+    try:
+        gdown.download(id=v.id, output=chemin, quiet=True)
+        insta_ok = etat.setdefault("insta_ok", {})
+        if nom not in insta_ok:  # évite un double post Insta si Facebook plante
+            publier_insta(compte, chemin, titre)
+            insta_ok[nom] = True
+        publier_fb(compte, chemin, titre)
+        etat["publiees"][nom] = maintenant.strftime("%d/%m/%Y %H:%M")
+        etat["creneaux"][creneau] = nom
+        print(f"Publié : {nom} (créneau {creneau}). Reste {len(file) - 1} vidéo(s) en attente.")
+    except Exception as e:
+        print(f"ERREUR sur {nom} : {e}")
+        json.dump(etat, open(STATE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+        sys.exit(1)  # GitHub t'envoie un mail
     json.dump(etat, open(STATE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    sys.exit(1 if erreurs else 0)  # en cas d'erreur, GitHub t'envoie un mail
 
 
 if __name__ == "__main__":
