@@ -25,8 +25,8 @@ jobs:
       - name: Publier les vidéos à l'heure
         env:
           META_COMPTES: ${{ secrets.META_COMPTES }}
-          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
           DRIVE_FOLDER_URL: ${{ secrets.DRIVE_FOLDER_URL }}
+          HEURES: "18:30"  # créneaux de sortie, ex. "12:00,18:30" pour 2 vidéos par jour
         run: python publish.py
       - name: Sauver l'état
         if: always()
